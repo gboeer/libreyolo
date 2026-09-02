@@ -11,7 +11,7 @@ Adapted for LibreYOLO.
 import logging
 import warnings
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from PIL import Image
@@ -29,6 +29,7 @@ def parse_yolo_label_line(
     label_path: Optional[Path] = None,
     return_segment: bool = False,
     single_cls: bool = False,
+    class_remap: Optional[Dict[int, int]] = None,
 ) -> Optional[Tuple]:
     """
     Parse a single line from a YOLO label file.
@@ -41,6 +42,12 @@ def parse_yolo_label_line(
             not have the dataset class count available.
         label_path: Path to label file (for warnings)
         single_cls: Remap non-negative class ids to class 0 before validation.
+            Ignored when ``class_remap`` is given.
+        class_remap: Optional ``{orig_id: new_id}`` mapping for training on a
+            class subset (see ``load_data_config(classes=...)``). A class id
+            not present as a key is silently dropped (excluded by design, not
+            a data error); one present is rewritten to its mapped id before
+            the bounds check below. Takes precedence over ``single_cls``.
 
     Returns:
         Tuple of (class_id, x1, y1, x2, y2, area) in pixel coordinates,
@@ -94,7 +101,11 @@ def parse_yolo_label_line(
             )
         return None
 
-    if single_cls and class_id >= 0:
+    if class_remap is not None:
+        if class_id not in class_remap:
+            return None
+        class_id = class_remap[class_id]
+    elif single_cls and class_id >= 0:
         class_id = 0
 
     # Validate class ID
