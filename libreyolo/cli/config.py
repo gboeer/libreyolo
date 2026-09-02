@@ -449,6 +449,7 @@ def _build_rfdetr_train_kwargs(
         "cache": "cache",
         "class_balanced": "class_balanced",
         "single_cls": "single_cls",
+        "classes": "classes",
         "average_best": "average_best",
         "export_check": "export_check",
         "precise_bn": "precise_bn",
