@@ -1427,7 +1427,10 @@ class BaseTrainer(ABC):
                 single_cls=self.config.single_cls,
                 classes=self.config.classes,
             )
-            resolved = int(data_cfg.get("nc", resolved))
+            data_nc = data_cfg.get("nc")
+            if data_nc is None and data_cfg.get("names") is not None:
+                data_nc = len(data_cfg["names"])
+            resolved = int(data_nc) if data_nc is not None else resolved
             self._resolved_class_names = data_cfg.get("names")
 
         self.num_classes = resolved

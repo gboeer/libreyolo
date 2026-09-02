@@ -18,6 +18,7 @@ id to 0) since that is an intentional merge, not an exclusion.
 from __future__ import annotations
 
 import json
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -565,3 +566,75 @@ def test_libreyolo9_train_end_to_end_keeps_original_nc_and_names(tmp_path):
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     assert checkpoint["nc"] == 10
     assert checkpoint["names"] == expected_names
+
+
+# ---------------------------------------------------------------------------
+# nc must be derivable from len(names) when the yaml omits an explicit nc:
+# key -- BaseTrainer._setup_data() already did this; _resolve_num_classes_
+# from_data_config() and DFINE/DEIM's by-hand _setup_data() copies did not,
+# so a trainer built with a stale initial num_classes (e.g. from a
+# previously loaded checkpoint) never got corrected and produced exactly
+# the out-of-range warning this test guards against.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("trainer_import", "size"),
+    [
+        ("libreyolo.models.rtdetr.trainer:RTDETRTrainer", "r18"),
+        ("libreyolo.models.dfine.trainer:DFINETrainer", "n"),
+        ("libreyolo.models.deim.trainer:DEIMTrainer", "n"),
+    ],
+)
+def test_nc_derives_from_names_when_yaml_omits_nc_even_with_stale_initial_value(
+    tmp_path, trainer_import, size
+):
+    module_name, class_name = trainer_import.split(":")
+    module = __import__(module_name, fromlist=[class_name])
+    trainer_cls = getattr(module, class_name)
+
+    img_dir = tmp_path / "images" / "train"
+    lbl_dir = tmp_path / "labels" / "train"
+    img_dir.mkdir(parents=True)
+    lbl_dir.mkdir(parents=True)
+    Image.new("RGB", (64, 48), color="white").save(img_dir / "sample.jpg")
+    (lbl_dir / "sample.txt").write_text("9 0.1 0.1 0.05 0.05\n0 0.5 0.5 0.05 0.05\n")
+    data_yaml = tmp_path / "data.yaml"
+    data_yaml.write_text(
+        yaml.safe_dump(
+            {
+                "path": str(tmp_path),
+                "train": "images/train",
+                "names": [f"c{i}" for i in range(11)],
+                # deliberately no "nc" key
+            }
+        )
+    )
+
+    trainer = trainer_cls(
+        model=torch.nn.Identity(),
+        size=size,
+        num_classes=7,  # stale, e.g. from a previously loaded checkpoint
+        data=str(data_yaml),
+        classes=[0, 1, 2, 3, 4, 5, 9],
+        epochs=1,
+        batch=1,
+        imgsz=64,
+        device="cpu",
+        amp=False,
+        ema=False,
+        workers=0,
+        eval_interval=-1,
+    )
+
+    trainer.on_num_classes_resolved()
+    assert trainer.num_classes == 11
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        trainer._setup_data()
+    assert not any(issubclass(w.category, UserWarning) for w in caught)
+
+    assert trainer.num_classes == 11
+    labels = trainer.train_loader.dataset.dataset.annotations[0][0]
+    assert sorted(labels[:, 4].tolist()) == [0.0, 9.0]

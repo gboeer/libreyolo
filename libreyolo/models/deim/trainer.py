@@ -368,7 +368,12 @@ class DEIMTrainer(DETREncoderCudaGraphMixin, BaseTrainer):
             )
             class_remap = data_cfg.get("_class_remap")
             data_dir = data_cfg["root"]
-            self.num_classes = data_cfg.get("nc", self.config.num_classes)
+            data_nc = data_cfg.get("nc")
+            if data_nc is None and data_cfg.get("names") is not None:
+                data_nc = len(data_cfg["names"])
+            self.num_classes = (
+                int(data_nc) if data_nc is not None else self.config.num_classes
+            )
 
             ann_file = Path(data_dir) / "annotations" / "instances_train2017.json"
             coco_ann_file = get_coco_annotation_file(data_cfg, "train")
