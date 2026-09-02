@@ -19,8 +19,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+import torch
 import yaml
 from PIL import Image
 
@@ -28,7 +30,10 @@ from libreyolo.data.dataset import COCODataset, YOLODataset
 from libreyolo.data.obb import parse_yolo_obb_label_line
 from libreyolo.data.utils import build_class_remap, load_data_config
 from libreyolo.data.yolo_coco_api import parse_yolo_label_line
+from libreyolo.models.base.model import _wrap_train_with_cfg
 from libreyolo.training.config import TrainConfig
+from libreyolo.validation.config import ValidationConfig
+from libreyolo.validation.detection_validator import DetectionValidator
 
 pytestmark = pytest.mark.unit
 
@@ -267,3 +272,296 @@ def test_coco_dataset_classes_drops_excluded_keeps_original_labels(tmp_path):
     labels = dataset.annotations[0][0]
     assert labels.shape[0] == 3
     assert sorted(labels[:, 4].tolist()) == [0.0, 1.0, 3.0]
+
+
+# ---------------------------------------------------------------------------
+# End-to-end trainer
+# ---------------------------------------------------------------------------
+
+
+def _write_train_dataset(tmp_path, nc=4, names=("car", "bicycle", "dog", "cat")):
+    img_dir = tmp_path / "images" / "train"
+    lbl_dir = tmp_path / "labels" / "train"
+    img_dir.mkdir(parents=True)
+    lbl_dir.mkdir(parents=True)
+    Image.new("RGB", (64, 48), color="white").save(img_dir / "sample.jpg")
+    (lbl_dir / "sample.txt").write_text(
+        "0 0.1 0.1 0.1 0.1\n1 0.3 0.3 0.1 0.1\n2 0.5 0.5 0.1 0.1\n3 0.7 0.7 0.1 0.1\n"
+    )
+    return _write_data_yaml(tmp_path, nc=nc, names=names)
+
+
+@pytest.mark.parametrize(
+    ("trainer_import", "size"),
+    [
+        # Uses the shared BaseTrainer._setup_data.
+        ("libreyolo.models.rtdetr.trainer:RTDETRTrainer", "r18"),
+        # DFINE/DEIM mirror BaseTrainer._setup_data by hand -- independent
+        # copy of the same class-filter wiring.
+        ("libreyolo.models.dfine.trainer:DFINETrainer", "n"),
+        ("libreyolo.models.deim.trainer:DEIMTrainer", "n"),
+    ],
+)
+def test_trainer_setup_data_trains_only_the_requested_class_subset(
+    tmp_path, trainer_import, size
+):
+    module_name, class_name = trainer_import.split(":")
+    module = __import__(module_name, fromlist=[class_name])
+    trainer_cls = getattr(module, class_name)
+
+    data_yaml = _write_train_dataset(tmp_path)
+    trainer = trainer_cls(
+        model=torch.nn.Identity(),
+        size=size,
+        num_classes=4,
+        data=str(data_yaml),
+        classes=[0, 1, 3],
+        epochs=1,
+        batch=1,
+        imgsz=64,
+        device="cpu",
+        amp=False,
+        ema=False,
+        workers=0,
+        eval_interval=-1,
+    )
+
+    trainer._setup_data()
+
+    # nc stays the full declared count -- classes= only filters the loss.
+    assert trainer.num_classes == 4
+    raw_dataset = trainer.train_loader.dataset.dataset
+    labels = raw_dataset.annotations[0][0]
+    assert labels.shape[0] == 3
+    assert sorted(labels[:, 4].tolist()) == [0.0, 1.0, 3.0]
+
+
+# ---------------------------------------------------------------------------
+# Validator auto-inherit
+# ---------------------------------------------------------------------------
+
+
+def test_validator_auto_inherits_classes_from_checkpoint(tmp_path):
+    data_yaml = _write_train_dataset(tmp_path)
+    model = SimpleNamespace(
+        nb_classes=4,
+        _checkpoint_train_config=lambda: {"classes": [0, 1, 3]},
+        _get_val_preprocessor=lambda img_size: None,
+    )
+    config = ValidationConfig(
+        data=str(data_yaml), batch_size=1, num_workers=0, device="cpu"
+    )
+
+    validator = DetectionValidator(model, config)
+
+    assert validator.config.classes == [0, 1, 3]
+    dataloader = validator._setup_dataloader()
+    assert validator.nc == 4
+    assert validator.class_names == ["car", "bicycle", "dog", "cat"]
+    labels = dataloader.dataset.annotations[0][0]
+    assert labels.shape[0] == 3
+
+
+def test_validator_explicit_classes_not_overridden_by_checkpoint(tmp_path):
+    data_yaml = _write_train_dataset(tmp_path)
+    model = SimpleNamespace(
+        nb_classes=4,
+        _checkpoint_train_config=lambda: {"classes": [0, 1, 3]},
+        _get_val_preprocessor=lambda img_size: None,
+    )
+    config = ValidationConfig(
+        data=str(data_yaml),
+        batch_size=1,
+        num_workers=0,
+        device="cpu",
+        classes=[0, 2],
+    )
+
+    validator = DetectionValidator(model, config)
+
+    assert validator.config.classes == [0, 2]
+
+
+# ---------------------------------------------------------------------------
+# _wrap_train_with_cfg gate
+# ---------------------------------------------------------------------------
+
+
+def test_python_gate_accepts_classes_for_g0_g1_detection():
+    def train(self, data, **kwargs):
+        return kwargs
+
+    wrapped = _wrap_train_with_cfg(train)
+    wrapper = SimpleNamespace(FAMILY="rtdetr", task="detect")
+
+    result = wrapped(wrapper, "data.yaml", classes=[0, 1, 3])
+
+    assert result["classes"] == [0, 1, 3]
+
+
+def test_python_gate_rejects_classes_for_unsupported_family_or_task():
+    def train(self, data, **kwargs):
+        return kwargs
+
+    wrapped = _wrap_train_with_cfg(train)
+    wrapper = SimpleNamespace(FAMILY="yolox", task="detect")
+
+    with pytest.raises(ValueError, match="G0/G1 detection"):
+        wrapped(wrapper, "data.yaml", classes=[0, 1])
+
+
+def test_resume_inherits_classes_from_checkpoint():
+    def train(self, data, *, resume=False, **kwargs):
+        return kwargs
+
+    wrapped = _wrap_train_with_cfg(train)
+    wrapper = SimpleNamespace(
+        FAMILY="yolo9",
+        task="detect",
+        model_path="last.pt",
+        _checkpoint_train_config=lambda source=None: {"classes": [0, 1, 3]},
+    )
+
+    result = wrapped(wrapper, "data.yaml", resume=True)
+
+    assert result["classes"] == [0, 1, 3]
+
+
+# ---------------------------------------------------------------------------
+# on_num_classes_resolved: the wrapper's real names must survive the head
+# rebuild, not just its class count. _rebuild_for_new_classes() always resets
+# to generic class_N placeholders; only _sync_wrapped_model_num_classes
+# restores real names afterward, via _resolved_class_names stashed by
+# _resolve_num_classes_from_data_config. This holds regardless of classes=,
+# which never changes nc/names here -- see build_class_remap's docstring.
+# ---------------------------------------------------------------------------
+
+
+class _FakeDetector(torch.nn.Module):
+    def __init__(self, num_classes: int):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(1))
+        self.decoder = SimpleNamespace(num_classes=num_classes, reg_max=32)
+
+
+class _FakeWrapper:
+    task = "detect"
+
+    def __init__(self, num_classes: int):
+        self.nb_classes = num_classes
+        self.names = {i: f"class_{i}" for i in range(num_classes)}
+        self.device = torch.device("cpu")
+        self.model = _FakeDetector(num_classes)
+
+    def _rebuild_for_new_classes(self, num_classes: int):
+        self.nb_classes = num_classes
+        self.names = {i: f"class_{i}" for i in range(num_classes)}
+        self.model = _FakeDetector(num_classes)
+
+
+def _build_rtdetr_trainer(data_yaml, wrapper, **overrides):
+    from libreyolo.models.rtdetr.trainer import RTDETRTrainer
+
+    kwargs = dict(
+        model=wrapper.model,
+        wrapper_model=wrapper,
+        size="r18",
+        num_classes=wrapper.nb_classes,
+        data=str(data_yaml),
+        epochs=1,
+        batch=1,
+        imgsz=64,
+        device="cpu",
+        workers=0,
+        amp=False,
+        ema=False,
+        no_aug_epochs=0,
+        warmup_epochs=0,
+        eval_interval=-1,
+    )
+    kwargs.update(overrides)
+    return RTDETRTrainer(**kwargs)
+
+
+def test_sync_ignores_classes_for_nc_and_names_resolution(tmp_path):
+    """classes= is a loss-time filter only: nc/names resolve exactly as they
+    would without it (the full 10-class dataset), even though only 7 ids are
+    requested for training."""
+    data_yaml = _write_data_yaml(tmp_path, nc=10, names=NAMES10)
+    wrapper = _FakeWrapper(num_classes=80)
+    trainer = _build_rtdetr_trainer(data_yaml, wrapper, classes=[0, 3, 5, 6, 7, 8, 9])
+
+    trainer.on_num_classes_resolved()
+
+    assert wrapper.nb_classes == 10
+    assert wrapper.names == {i: name for i, name in enumerate(NAMES10)}
+
+
+def test_sync_restores_real_names_for_plain_full_dataset_training(tmp_path):
+    """Not classes=-specific: any dataset-driven head resize (nc mismatch
+    against the loaded checkpoint) must end up with the dataset's real names,
+    not generic placeholders -- this held for single_cls already, now for
+    every case _resolved_class_names can supply."""
+    data_yaml = _write_data_yaml(tmp_path, nc=3, names=("car", "bicycle", "dog"))
+    wrapper = _FakeWrapper(num_classes=80)
+    trainer = _build_rtdetr_trainer(data_yaml, wrapper)
+
+    trainer.on_num_classes_resolved()
+
+    assert wrapper.nb_classes == 3
+    assert wrapper.names == {0: "car", 1: "bicycle", 2: "dog"}
+
+
+def test_sync_no_rebuild_still_applies_names(tmp_path):
+    """When the wrapper already has the right class count (no rebuild
+    needed), the not-needs-rebuild branch must still stamp the correct
+    names -- it used to only special-case single_cls there."""
+    data_yaml = _write_data_yaml(tmp_path, nc=10, names=NAMES10)
+    wrapper = _FakeWrapper(num_classes=10)  # already the right count
+    trainer = _build_rtdetr_trainer(data_yaml, wrapper, classes=[0, 3, 5, 6, 7, 8, 9])
+
+    trainer.on_num_classes_resolved()
+
+    assert wrapper.names == {i: name for i, name in enumerate(NAMES10)}
+
+
+# ---------------------------------------------------------------------------
+# End-to-end through LibreYOLO9.train() -- the real user-facing entry point.
+#
+# Confirms the three places that used to independently resolve nc/names
+# (Trainer._resolve_num_classes_from_data_config, BaseTrainer._setup_data,
+# and YOLO9's own model.py::train()) agree: none of them need to know about
+# classes= at all anymore, since it never changes nc/names. That is what
+# makes this design change smaller and safer than the compacting-remap one
+# it replaces -- see build_class_remap's docstring.
+# ---------------------------------------------------------------------------
+
+
+def test_libreyolo9_train_end_to_end_keeps_original_nc_and_names(tmp_path):
+    from libreyolo import LibreYOLO9
+
+    data_yaml = _write_train_dataset(tmp_path, nc=10, names=NAMES10)
+    model = LibreYOLO9(None, size="t", device="cpu")
+
+    model.train(
+        data=str(data_yaml),
+        classes=[0, 3, 5, 6, 7, 8, 9],
+        epochs=1,
+        batch=1,
+        imgsz=64,
+        device="cpu",
+        workers=0,
+        amp=False,
+        ema=False,
+        project=str(tmp_path / "runs"),
+        name="exp",
+    )
+
+    expected_names = {i: name for i, name in enumerate(NAMES10)}
+    assert model.nb_classes == 10
+    assert model.names == expected_names
+
+    checkpoint_path = tmp_path / "runs" / "exp" / "weights" / "last.pt"
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    assert checkpoint["nc"] == 10
+    assert checkpoint["names"] == expected_names
